@@ -1,4 +1,3 @@
-
 # =============================================================================
 # SOLAR IRRADIANCE FORECASTING: Bi-LSTM vs Bi-GRU (Updated)
 # Paper: Forecasting Using Deep LSTM Neural Network for Future Weather Prediction
@@ -37,7 +36,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 from statsmodels.tsa.stattools import adfuller
@@ -45,6 +43,14 @@ from statsmodels.stats.diagnostic import acorr_ljungbox
 from statsmodels.tsa.arima.model import ARIMA
 import statsmodels.api as sm
 from scipy.stats import normaltest, probplot, norm
+
+import random
+SEED = 42
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PATHS  ── all outputs go to  <script_dir>/outputs/
@@ -78,7 +84,12 @@ MC_SAMPLES     = 50      # Monte Carlo Dropout forward passes
 HORIZONS       = [20, 40, 60]  # Multi-horizon evaluation steps
 DEVICE         = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 TOLERANCE_PCT  = 0.20    # ±20 % tolerance accuracy (per paper & reviewer)
-GHI_COL        = 'Global Horizontal Irradiance(rsi)'
+TIME_COL       = "time"
+GHI_COL        = "GHIrsi"
+TEMP_COL       = "Tamb"
+RH_COL         = "RH"
+WS_COL         = "WS"
+BP_COL         = "BP"
 
 print(f"Device: {DEVICE}")
 
@@ -89,22 +100,46 @@ print("\n" + "="*60)
 print("STEP 1 – LOADING AND CLEANING DATA")
 print("="*60)
 
-df_raw = pd.read_csv(r"C:\Users\ALH\Desktop\PythonVS\CBU1.csv")
-print(f"Raw rows: {len(df_raw):,}   Columns: {df_raw.columns.tolist()}")
+# Read the CSV while skipping the units and average rows
+# Read CSV
+df_raw = pd.read_csv(
+    r"C:\Users\ALH\Desktop\PythonVS\CBU1.csv",
+    encoding="cp1252",
+    skiprows=[1, 2]
+)
 
-# Parse time, build proper Datetime index (Jan 1 2024, 10-min intervals)
-df_raw['Datetime'] = pd.date_range(start='2024-01-01 00:10:00',
-                                   periods=len(df_raw), freq='10min')
-df_raw['Hour']  = df_raw['Datetime'].dt.hour
-df_raw['Month'] = df_raw['Datetime'].dt.month
+print("Raw rows:", len(df_raw))
+print("Columns:", df_raw.columns.tolist())
+print(df_raw.head())
 
-# Fix barometric pressure outliers (< 950 hPa → replace with column mean)
-bp_mean = df_raw['Barometric Pressure'].mean()
-df_raw['Barometric Pressure'] = df_raw['Barometric Pressure'].clip(lower=950).where(
-    df_raw['Barometric Pressure'] >= 950, bp_mean)
+# Convert weather columns to numeric
+numeric_cols = [GHI_COL, TEMP_COL, RH_COL, WS_COL, BP_COL]
 
-# Linear interpolation for missing values (< 0.005 % of data)
-df_raw.interpolate(method='linear', inplace=True)
+for col in numeric_cols:
+    df_raw[col] = pd.to_numeric(df_raw[col], errors="coerce")
+
+# Build datetime features
+df_raw["Datetime"] = pd.date_range(
+    start="2024-01-01 00:10:00",
+    periods=len(df_raw),
+    freq="10min"
+)
+
+df_raw["Hour"] = df_raw["Datetime"].dt.hour
+df_raw["Month"] = df_raw["Datetime"].dt.month
+
+# Fix BP outliers
+bp_mean = df_raw[BP_COL].mean()
+df_raw[BP_COL] = df_raw[BP_COL].clip(lower=950)
+df_raw.loc[df_raw[BP_COL] < 950, BP_COL] = bp_mean
+
+# Fill missing values
+df_raw[numeric_cols] = (
+    df_raw[numeric_cols]
+    .interpolate(method="linear")
+    .bfill()
+    .ffill()
+)
 
 # ── NIGHT VALUE REMOVAL ──────────────────────────────────────────────────────
 # Nighttime rows (GHI ≤ 0) inject trivial zero-patterns that inflate metrics
@@ -117,10 +152,10 @@ print(f"Night rows removed (GHI ≤ 0): {n_removed:,}  "
 print(f"Daytime rows retained: {len(df):,}")
 
 FEATURE_COLS = [GHI_COL,
-                'Ambient Temperature',
-                'Relative Humdity',
-                'Wind Speed',
-                'Barometric Pressure']
+                TEMP_COL,
+                RH_COL,
+                WS_COL,
+                BP_COL]
 n_features = len(FEATURE_COLS)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -425,6 +460,17 @@ def measure_inference_time(model, loader, label=''):
           f"| {per_sample*1000:.3f} ms/sample")
     return total, per_sample
 
+def measure_inference_time_avg(model, loader, repeats=5, label=''):
+    """Average inference latency over several repeats (CPU timing is noisy)."""
+    totals, pers = [], []
+    for _ in range(repeats):
+        total, per = measure_inference_time(model, loader)
+        totals.append(total); pers.append(per)
+    total_m, per_m = np.mean(totals), np.mean(pers)
+    print(f"  [{label}] Inference (avg of {repeats}): "
+          f"{total_m*1000:.1f} ms total | {per_m*1000:.4f} ms/sample")
+    return total_m, per_m
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. BOOTSTRAP CONFIDENCE INTERVALS
@@ -492,14 +538,19 @@ print("STEP 3 – TRAINING BI-LSTM")
 print("="*60)
 
 model_lstm = BiLSTMModel(n_features, HIDDEN_SIZE, N_LAYERS, n_features, DROPOUT).to(DEVICE)
+_t = time.time()
 model_lstm, losses_lstm = train_model(
     model_lstm, train_loader, X_test, y_test, label='Bi-LSTM')
+lstm_train_time = time.time() - _t
+print(f"[Bi-LSTM] training: {lstm_train_time:.1f} s total "
+      f"({lstm_train_time/len(losses_lstm):.1f} s/epoch over {len(losses_lstm)} epochs)")
+
 
 preds_lstm, trues, metrics_lstm = evaluate_model(
     model_lstm, X_test, y_test, scaler, label='Bi-LSTM')
 
-infer_lstm_total, infer_lstm_per = measure_inference_time(
-    model_lstm, test_loader, 'Bi-LSTM')
+infer_lstm_total, infer_lstm_per = measure_inference_time_avg(
+    model_lstm, test_loader, repeats=5, label='Bi-LSTM')
 
 # ── MAE / RMSE per feature ────────────────────────────────────────────────────
 lstm_rmse_per = np.sqrt(((trues - preds_lstm)**2).mean(0))
@@ -518,10 +569,11 @@ print(f"  [Bi-LSTM] RMSE = {metrics_lstm['RMSE']:.4f}  "
 # ── R² bootstrap CIs ─────────────────────────────────────────────────────────
 rng = np.random.default_rng(42)
 r2_boot = []
-n = len(trues.flatten())
+n = len(trues)                       # resample timesteps; keep all 5 features per draw
 for _ in range(BOOTSTRAP_N):
     idx = rng.integers(0, n, n)
-    r2_boot.append(r2_score(trues.flatten()[idx], preds_lstm.flatten()[idx]))
+    r2_boot.append(r2_score(trues[idx], preds_lstm[idx]))   # 2-D -> matches point R²
+    
 lstm_r2_ci = np.percentile(r2_boot, [2.5, 97.5])
 print(f"  [Bi-LSTM] R²   = {metrics_lstm['R2']:.4f}  "
       f"95% CI: [{lstm_r2_ci[0]:.4f}, {lstm_r2_ci[1]:.4f}]")
@@ -535,14 +587,19 @@ print("STEP 4 – TRAINING BI-GRU")
 print("="*60)
 
 model_gru = BiGRUModel(n_features, HIDDEN_SIZE, N_LAYERS, n_features, DROPOUT).to(DEVICE)
+_t = time.time()
 model_gru, losses_gru = train_model(
     model_gru, train_loader, X_test, y_test, label='Bi-GRU')
+gru_train_time = time.time() - _t
+print(f"[Bi-GRU] training: {gru_train_time:.1f} s total "
+      f"({gru_train_time/len(losses_gru):.1f} s/epoch over {len(losses_gru)} epochs)")
+
 
 preds_gru, trues_gru, metrics_gru = evaluate_model(
     model_gru, X_test, y_test, scaler, label='Bi-GRU')
 
-infer_gru_total, infer_gru_per = measure_inference_time(
-    model_gru, test_loader, 'Bi-GRU')
+infer_gru_total, infer_gru_per = measure_inference_time_avg(
+    model_gru, test_loader, repeats=5, label='Bi-GRU')
 
 gru_rmse_per = np.sqrt(((trues_gru - preds_gru)**2).mean(0))
 
@@ -553,13 +610,64 @@ print(f"  [Bi-GRU] RMSE = {metrics_gru['RMSE']:.4f}  "
       f"95% CI: [{gru_rmse_ci[0]:.4f}, {gru_rmse_ci[1]:.4f}]")
 
 r2_boot_gru = []
+n = len(trues_gru)                   # rows, not flattened
 for _ in range(BOOTSTRAP_N):
     idx = rng.integers(0, n, n)
-    r2_boot_gru.append(r2_score(trues_gru.flatten()[idx],
-                                preds_gru.flatten()[idx]))
+    r2_boot_gru.append(r2_score(trues_gru[idx], preds_gru[idx]))
+
 gru_r2_ci = np.percentile(r2_boot_gru, [2.5, 97.5])
 print(f"  [Bi-GRU] R²   = {metrics_gru['R2']:.4f}  "
       f"95% CI: [{gru_r2_ci[0]:.4f}, {gru_r2_ci[1]:.4f}]")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# STATISTICAL SIGNIFICANCE TESTING: Bi-LSTM vs Bi-GRU
+# ─────────────────────────────────────────────────────────────────────
+from scipy.stats import wilcoxon, t as t_dist
+
+def diebold_mariano(e1, e2, h=1, power=2):
+    """
+    Diebold-Mariano test of equal predictive accuracy (Harvey-Leybourne-
+    Newbold small-sample correction). e1, e2 = aligned forecast errors
+    (true - pred) for model 1 and model 2. power=2 -> squared-error loss.
+    DM>0 => model 1 has the LARGER loss (i.e. model 2 is better).
+    """
+    e1, e2 = np.asarray(e1, float), np.asarray(e2, float)
+    d = np.abs(e1)**power - np.abs(e2)**power      # loss differential
+    T = len(d); d_bar = d.mean()
+    gamma0 = np.mean((d - d_bar)**2)
+    gammas = [np.mean((d[k:] - d_bar)*(d[:-k] - d_bar)) for k in range(1, h)]
+    var_d = (gamma0 + 2*sum(gammas)) / T
+    DM = d_bar / np.sqrt(var_d)
+    corr = np.sqrt((T + 1 - 2*h + h*(h-1)/T) / T)
+    DM_star = DM * corr
+    p = 2 * (1 - t_dist.cdf(abs(DM_star), df=T-1))
+    return DM_star, p
+
+print("\n" + "="*60)
+print("STATISTICAL SIGNIFICANCE: Bi-LSTM vs Bi-GRU")
+print("="*60)
+
+# Per-feature Diebold-Mariano (squared-error loss, one-step)
+dm_rows = []
+for i, col in enumerate(FEATURE_COLS):
+    e_lstm = trues[:, i]     - preds_lstm[:, i]
+    e_gru  = trues_gru[:, i] - preds_gru[:, i]
+    dm, p = diebold_mariano(e_lstm, e_gru, h=1, power=2)
+    favors = "Bi-GRU" if dm > 0 else "Bi-LSTM"
+    dm_rows.append(dict(Feature=col, DM=round(dm, 3),
+                        p_value=p, Favors=favors))
+    print(f"  {col:35s} DM={dm:+.3f}  p={p:.3e}  favors {favors}")
+dm_df = pd.DataFrame(dm_rows)
+
+# Paired Wilcoxon on per-timestamp mean absolute error across all features
+ae_lstm = np.abs(trues     - preds_lstm).mean(axis=1)
+ae_gru  = np.abs(trues_gru - preds_gru ).mean(axis=1)
+w_stat, w_p = wilcoxon(ae_lstm, ae_gru)
+print(f"\n  Wilcoxon signed-rank (pooled per-timestamp MAE): "
+      f"W={w_stat:.1f}  p={w_p:.3e}")
+print(f"  Median MAE  Bi-LSTM={np.median(ae_lstm):.4f} | "
+      f"Bi-GRU={np.median(ae_gru):.4f}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -586,7 +694,7 @@ for ModelClass, label in [(UniLSTMModel, 'Uni-LSTM'),
         m = ModelClass(n_features, HIDDEN_SIZE, N_LAYERS,
                        n_features, DROPOUT).to(DEVICE)
         m, _ = train_model(m, train_loader, X_test, y_test,
-                           label=label, epochs=30, patience=5)
+                      label=label, epochs=N_EPOCHS, patience=PATIENCE)
         _, _, m_metrics = evaluate_model(m, X_test, y_test, scaler, label)
     ablation_results[label] = m_metrics
 
@@ -638,8 +746,38 @@ arima_mae  = mean_absolute_error(ghi_test, arima_preds)
 arima_rmse = np.sqrt(mean_squared_error(ghi_test, arima_preds))
 arima_r2   = r2_score(ghi_test, arima_preds)
 print(f"  ARIMA  MAE={arima_mae:.4f}  RMSE={arima_rmse:.4f}  R²={arima_r2:.4f}")
+# ─────────────────────────────────────────────────────────────────────────────
+# 13b. PERSISTENCE (NAÏVE) BASELINE  (GHI)
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n" + "="*60)
+print("STEP 6b – PERSISTENCE BASELINE  (GHI)")
+print("="*60)
 
+# One-step persistence: the forecast for time t is the observed value at t-1
+persist_preds = np.concatenate([[ghi_train[-1]], ghi_test[:-1]])
+persist_mae  = mean_absolute_error(ghi_test, persist_preds)
+persist_rmse = np.sqrt(mean_squared_error(ghi_test, persist_preds))
+persist_r2   = r2_score(ghi_test, persist_preds)
+print(f"  Persistence (1-step)  MAE={persist_mae:.4f}  "
+      f"RMSE={persist_rmse:.4f}  R²={persist_r2:.4f}")
 
+# Multi-horizon persistence: hold the last observed value flat for h steps,
+# averaged over the same rolling origins used for the DL horizon analysis
+persist_h_rows = []
+for h in HORIZONS:
+    maes, rmses = [], []
+    for o in range(N_INPUT, len(ghi_test) - h, 10):
+        last_val = ghi_test[o-1]
+        truth    = ghi_test[o:o+h]
+        pred     = np.full(h, last_val)
+        maes.append(mean_absolute_error(truth, pred))
+        rmses.append(np.sqrt(mean_squared_error(truth, pred)))
+    persist_h_rows.append(dict(Horizon=h,
+                               MAE=round(float(np.mean(maes)), 4),
+                               RMSE=round(float(np.mean(rmses)), 4)))
+    print(f"  Persistence  h={h}  MAE={np.mean(maes):.4f}  RMSE={np.mean(rmses):.4f}")
+persist_h_df = pd.DataFrame(persist_h_rows)
+persist_1step_df = pd.DataFrame([{'Metric': 'Persistence_1step', 'MAE': persist_mae, 'RMSE': persist_rmse, 'R2': persist_r2}])
 # ─────────────────────────────────────────────────────────────────────────────
 # 14. MULTI-HORIZON RECURSIVE FORECASTING
 # ─────────────────────────────────────────────────────────────────────────────
@@ -647,29 +785,53 @@ print("\n" + "="*60)
 print("STEP 7 – MULTI-HORIZON RECURSIVE FORECASTING")
 print("="*60)
 
-seed_lstm = scaled_test[-N_INPUT:]
-seed_gru  = scaled_test[-N_INPUT:]
+# Rolling-origin multi-horizon evaluation (correct alignment, averaged over origins)
+test_inv_full = scaler.inverse_transform(scaled_test)     # real units, indexed by time
+max_h   = max(HORIZONS)
+STRIDE  = 10                                              # subsample origins to bound CPU cost
+origins = range(N_INPUT, len(scaled_test) - max_h, STRIDE)
+
+ghi_idx = FEATURE_COLS.index(GHI_COL)                     # GHI column for baseline comparison
+acc     = {h: {'Bi-LSTM': ([], []), 'Bi-GRU': ([], [])} for h in HORIZONS}
+acc_ghi = {h: {'Bi-LSTM': ([], []), 'Bi-GRU': ([], []), 'Persistence': ([], [])} for h in HORIZONS}
+for o in origins:
+    seed  = scaled_test[o - N_INPUT:o]                    # window ending at origin o
+    truth = test_inv_full[o:o + max_h]                    # the ACTUAL next max_h steps
+    lstm_fc = scaler.inverse_transform(recursive_forecast(model_lstm, seed, max_h))
+    gru_fc  = scaler.inverse_transform(recursive_forecast(model_gru,  seed, max_h))
+    last_ghi = test_inv_full[o - 1, ghi_idx]              # last observed GHI (persistence forecast)
+    for h in HORIZONS:
+        for lbl, fc in [('Bi-LSTM', lstm_fc), ('Bi-GRU', gru_fc)]:
+            acc[h][lbl][0].append(mean_absolute_error(truth[:h], fc[:h]))
+            acc[h][lbl][1].append(np.sqrt(mean_squared_error(truth[:h], fc[:h])))
+            acc_ghi[h][lbl][0].append(mean_absolute_error(truth[:h, ghi_idx], fc[:h, ghi_idx]))
+            acc_ghi[h][lbl][1].append(np.sqrt(mean_squared_error(truth[:h, ghi_idx], fc[:h, ghi_idx])))
+        p_pred = np.full(h, last_ghi)                     # flat persistence over the SAME origin
+        acc_ghi[h]['Persistence'][0].append(mean_absolute_error(truth[:h, ghi_idx], p_pred))
+        acc_ghi[h]['Persistence'][1].append(np.sqrt(mean_squared_error(truth[:h, ghi_idx], p_pred)))
 
 horizon_rows = []
 for h in HORIZONS:
-    y_true_h = trues[:h]   # inverse-scaled already
-
-    lstm_rec = recursive_forecast(model_lstm, seed_lstm, h)
-    lstm_rec_inv = scaler.inverse_transform(lstm_rec)
-
-    gru_rec  = recursive_forecast(model_gru,  seed_gru, h)
-    gru_rec_inv = scaler.inverse_transform(gru_rec)
-
-    for model_label, rec_inv in [('Bi-LSTM', lstm_rec_inv),
-                                  ('Bi-GRU',  gru_rec_inv)]:
-        h_mae  = mean_absolute_error(y_true_h, rec_inv)
-        h_rmse = np.sqrt(mean_squared_error(y_true_h, rec_inv))
-        horizon_rows.append(dict(Model=model_label, Horizon=h,
-                                 MAE=round(h_mae,4), RMSE=round(h_rmse,4)))
-        print(f"  [{model_label}] h={h}  MAE={h_mae:.4f}  RMSE={h_rmse:.4f}")
-
+    for lbl in ['Bi-LSTM', 'Bi-GRU']:
+        maes, rmses = acc[h][lbl]
+        horizon_rows.append(dict(Model=lbl, Horizon=h,
+                                 MAE=round(float(np.mean(maes)), 4),
+                                 RMSE=round(float(np.mean(rmses)), 4),
+                                 MAE_std=round(float(np.std(maes)), 4),
+                                 RMSE_std=round(float(np.std(rmses)), 4)))
+        print(f"  [{lbl}] h={h}  MAE={np.mean(maes):.4f}  RMSE={np.mean(rmses):.4f}  "
+              f"(averaged over {len(maes)} origins)")
 horizon_df = pd.DataFrame(horizon_rows)
-
+# GHI-only horizon errors — Bi-LSTM, Bi-GRU, and Persistence over identical origins
+horizon_ghi_rows = []
+for h in HORIZONS:
+    for lbl in ['Bi-LSTM', 'Bi-GRU', 'Persistence']:
+        maes, rmses = acc_ghi[h][lbl]
+        horizon_ghi_rows.append(dict(Model=lbl, Horizon=h,
+                                     GHI_MAE=round(float(np.mean(maes)), 4),
+                                     GHI_RMSE=round(float(np.mean(rmses)), 4)))
+        print(f"  [GHI][{lbl:12s}] h={h}  MAE={np.mean(maes):.4f}  RMSE={np.mean(rmses):.4f}")
+horizon_ghi_df = pd.DataFrame(horizon_ghi_rows)
 # Error degradation plot
 lstm_h_rmse = horizon_df[horizon_df.Model=='Bi-LSTM']['RMSE'].tolist()
 gru_h_rmse  = horizon_df[horizon_df.Model=='Bi-GRU']['RMSE'].tolist()
@@ -945,9 +1107,76 @@ save_fig('11_predictions_vs_true.png')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 20b. PREDICTED vs ACTUAL COMPARISON TABLE (per variable, per model)
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n" + "="*60)
+print("STEP – BUILDING PREDICTION COMPARISON TABLE")
+print("="*60)
+
+# Predictions start N_INPUT steps into the test set (the lookback window
+# is consumed before the first prediction can be made), so align timestamps.
+test_timestamps = test_df['Datetime'].values[N_INPUT:]
+
+comparison_rows = []
+for i, col in enumerate(FEATURE_COLS):
+    true_vals      = trues[:, i]
+    lstm_pred_vals = preds_lstm[:, i]
+    gru_pred_vals  = preds_gru[:, i]
+
+    lstm_err = lstm_pred_vals - true_vals
+    gru_err  = gru_pred_vals  - true_vals
+
+    comp_df = pd.DataFrame({
+        'Datetime':          test_timestamps,
+        'Variable':          col,
+        'Actual':            true_vals,
+        'Bi-LSTM_Pred':      lstm_pred_vals,
+        'Bi-GRU_Pred':       gru_pred_vals,
+        'Bi-LSTM_Error':     lstm_err,
+        'Bi-GRU_Error':      gru_err,
+        'Bi-LSTM_AbsPctErr': np.abs(lstm_err) / (np.abs(true_vals) + 1e-8) * 100,
+        'Bi-GRU_AbsPctErr':  np.abs(gru_err)  / (np.abs(true_vals) + 1e-8) * 100,
+    })
+    comparison_rows.append(comp_df)
+
+comparison_df = pd.concat(comparison_rows, ignore_index=True)
+
+print("\nSample of comparison table (first 10 rows per variable):")
+print(comparison_df.groupby('Variable').head(10).to_string(index=False))
+
+# ── Per-variable summary (aggregated accuracy across full test set) ─────────
+summary_rows = []
+for col in FEATURE_COLS:
+    sub = comparison_df[comparison_df['Variable'] == col]
+    summary_rows.append(dict(
+        Variable       = col,
+        Actual_Mean    = sub['Actual'].mean(),
+        LSTM_Pred_Mean = sub['Bi-LSTM_Pred'].mean(),
+        GRU_Pred_Mean  = sub['Bi-GRU_Pred'].mean(),
+        LSTM_MAE       = mean_absolute_error(sub['Actual'], sub['Bi-LSTM_Pred']),
+        GRU_MAE        = mean_absolute_error(sub['Actual'], sub['Bi-GRU_Pred']),
+        LSTM_RMSE      = np.sqrt(mean_squared_error(sub['Actual'], sub['Bi-LSTM_Pred'])),
+        GRU_RMSE       = np.sqrt(mean_squared_error(sub['Actual'], sub['Bi-GRU_Pred'])),
+        LSTM_MAPE_pct  = sub['Bi-LSTM_AbsPctErr'].mean(),
+        GRU_MAPE_pct   = sub['Bi-GRU_AbsPctErr'].mean(),
+    ))
+variable_summary_df = pd.DataFrame(summary_rows).round(4)
+
+print("\nPer-Variable Prediction Comparison Summary:")
+print(variable_summary_df.to_string(index=False))
+
+# ── Save standalone CSVs (in addition to the Excel sheets added below) ──────
+comparison_df.to_csv(os.path.join(OUT_DIR, 'prediction_comparison_full.csv'), index=False)
+variable_summary_df.to_csv(os.path.join(OUT_DIR, 'prediction_comparison_summary.csv'), index=False)
+print("\n[saved] prediction_comparison_full.csv")
+print("[saved] prediction_comparison_summary.csv")
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 21. FUTURE FORECAST (N_FUTURE steps)
 # ─────────────────────────────────────────────────────────────────────────────
 print(f"\nGenerating {N_FUTURE}-step future forecasts ...")
+seed_lstm = scaled_test[-N_INPUT:]     # last observed window, used as the forecast seed
+seed_gru  = scaled_test[-N_INPUT:]
 
 future_lstm = scaler.inverse_transform(
     recursive_forecast(model_lstm, seed_lstm, N_FUTURE))
@@ -1036,12 +1265,16 @@ with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
     })
     feat_df.to_excel(writer, sheet_name='Feature Metrics', index=False)
 
+    variable_summary_df.to_excel(writer, sheet_name='Prediction Comparison', index=False)
+    comparison_df.to_excel(writer, sheet_name='Comparison Raw Data', index=False)
+
     # ── Ablation study ────────────────────────────────────────────────────────
     ablation_df.to_excel(writer, sheet_name='Ablation Study')
 
     # ── Multi-horizon ─────────────────────────────────────────────────────────
     horizon_df.to_excel(writer, sheet_name='Horizon Forecasting', index=False)
-
+    horizon_ghi_df.to_excel(writer, sheet_name='Horizon GHI', index=False)
+    
     # ── Monthly analysis ──────────────────────────────────────────────────────
     monthly_df.to_excel(writer, sheet_name='Monthly Analysis', index=False)
 
@@ -1054,6 +1287,9 @@ with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
     # ── Future forecast ───────────────────────────────────────────────────────
     future_df.to_excel(writer, sheet_name='Future Forecast')
 
+    
+    dm_df.to_excel(writer, sheet_name='Significance DM', index=False)
+
     # ── Training losses ───────────────────────────────────────────────────────
     pd.DataFrame({
         'Epoch': range(1, max(len(losses_lstm), len(losses_gru))+1),
@@ -1061,6 +1297,8 @@ with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
         'Bi-GRU Loss':  losses_gru  + [None]*(max(len(losses_lstm),len(losses_gru))-len(losses_gru)),
     }).to_excel(writer, sheet_name='Training Losses', index=False)
 
+    persist_h_df.to_excel(writer, sheet_name='Persistence', index=False)
+    persist_1step_df.to_excel(writer, sheet_name='Persistence 1step', index=False)
 print(f"\n✅ All results saved to: {excel_path}")
 print(f"✅ All figures saved to: {OUT_DIR}/")
 
@@ -1087,6 +1325,5 @@ for r in rows:
     print(f"{r[0]:<25} {v_lstm:>12} {v_gru:>12} {v_arima:>12}")
 print("="*60)
 print("\nDone. Check the outputs/ folder for all figures and Excel results.")
-
 
 
